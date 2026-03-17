@@ -1,6 +1,4 @@
-<p align="center">
-  <strong>> GitWire Core_</strong>
-</p>
+<h1 align="center">GitWire Core</h1>
 
 <p align="center">
   <a href="#"><img src="https://img.shields.io/badge/Next.js-15-black?style=flat-square&logo=next.js" alt="Next.js 15" /></a>
