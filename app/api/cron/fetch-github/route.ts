@@ -8,14 +8,36 @@ interface GitHubRepo {
   language: string | null;
   stargazers_count: number;
   forks_count: number;
+  open_issues_count: number;
+  license: { spdx_id: string; name: string } | null;
+  topics: string[];
+  pushed_at: string;
+  created_at: string;
+  archived: boolean;
+  homepage: string | null;
 }
 
 interface GitHubSearchResponse {
   items: GitHubRepo[];
 }
 
+async function getStarSnapshot(
+  repoId: string,
+  hoursAgo: number
+): Promise<number | null> {
+  const since = new Date(Date.now() - hoursAgo * 3600 * 1000).toISOString();
+  const { data } = await supabase
+    .from("trend_metrics")
+    .select("total_stars_snapshot")
+    .eq("repo_id", repoId)
+    .lte("snapshot_time", since)
+    .order("snapshot_time", { ascending: false })
+    .limit(1)
+    .single();
+  return data?.total_stars_snapshot ?? null;
+}
+
 export async function GET(request: NextRequest) {
-  // CRON_SECRET 인증 검증
   const authHeader = request.headers.get("authorization");
   const cronSecret = process.env.CRON_SECRET;
 
@@ -24,7 +46,6 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    // GitHub API 호출
     const githubHeaders: Record<string, string> = {
       Accept: "application/vnd.github.v3+json",
       "User-Agent": "GitWire-Core/1.0",
@@ -41,7 +62,9 @@ export async function GET(request: NextRequest) {
     );
 
     if (!githubRes.ok) {
-      throw new Error(`GitHub API error: ${githubRes.status} ${githubRes.statusText}`);
+      throw new Error(
+        `GitHub API error: ${githubRes.status} ${githubRes.statusText}`
+      );
     }
 
     const githubData: GitHubSearchResponse = await githubRes.json();
@@ -53,7 +76,6 @@ export async function GET(request: NextRequest) {
 
     for (const repo of repos) {
       try {
-        // repositories 테이블 upsert
         const { data: repoData, error: repoError } = await supabase
           .from("repositories")
           .upsert(
@@ -65,6 +87,13 @@ export async function GET(request: NextRequest) {
               total_stars: repo.stargazers_count,
               total_forks: repo.forks_count,
               updated_at: new Date().toISOString(),
+              open_issues_count: repo.open_issues_count,
+              license_name: repo.license?.spdx_id ?? null,
+              topics: repo.topics ?? [],
+              pushed_at: repo.pushed_at,
+              created_at_gh: repo.created_at,
+              archived: repo.archived,
+              homepage_url: repo.homepage,
             },
             { onConflict: "github_url" }
           )
@@ -72,28 +101,48 @@ export async function GET(request: NextRequest) {
           .single();
 
         if (repoError || !repoData) {
-          errors.push(`Failed to upsert ${repo.full_name}: ${repoError?.message}`);
+          errors.push(
+            `Failed to upsert ${repo.full_name}: ${repoError?.message}`
+          );
           continue;
         }
 
         upsertedCount++;
 
-        // trend_metrics 스냅샷 insert
-        const { error: metricError } = await supabase.from("trend_metrics").insert({
-          repo_id: repoData.id,
-          snapshot_time: new Date().toISOString(),
-          stars_24h: 0,
-          stars_1w: 0,
-          stars_1m: 0,
-        });
+        // Star delta 계산: 이전 스냅샷과 비교
+        const [snap24h, snap1w, snap1m] = await Promise.all([
+          getStarSnapshot(repoData.id, 24),
+          getStarSnapshot(repoData.id, 24 * 7),
+          getStarSnapshot(repoData.id, 24 * 30),
+        ]);
+
+        const currentStars = repo.stargazers_count;
+        const stars24h = snap24h !== null ? currentStars - snap24h : 0;
+        const stars1w = snap1w !== null ? currentStars - snap1w : 0;
+        const stars1m = snap1m !== null ? currentStars - snap1m : 0;
+
+        const { error: metricError } = await supabase
+          .from("trend_metrics")
+          .insert({
+            repo_id: repoData.id,
+            snapshot_time: new Date().toISOString(),
+            stars_24h: stars24h,
+            stars_1w: stars1w,
+            stars_1m: stars1m,
+            total_stars_snapshot: currentStars,
+          });
 
         if (metricError) {
-          errors.push(`Failed to insert metric for ${repo.full_name}: ${metricError.message}`);
+          errors.push(
+            `Failed to insert metric for ${repo.full_name}: ${metricError.message}`
+          );
         } else {
           snapshotCount++;
         }
       } catch (err) {
-        errors.push(`Unexpected error for ${repo.full_name}: ${String(err)}`);
+        errors.push(
+          `Unexpected error for ${repo.full_name}: ${String(err)}`
+        );
       }
     }
 
